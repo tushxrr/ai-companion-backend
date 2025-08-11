@@ -75,46 +75,7 @@ app.get('/api/conversations/:id', async (req, res) => {
 });
 
 // POST /api/messages
-app.post('/api/messages', async (req, res) => {
-    // Check if the model was initialized
-    if (!model) {
-        return res.status(500).json({ error: "AI model not initialized. Check server logs for API Key issues." });
-    }
-
-    let { conversation_id, message } = req.body;
-    const userId = '12345';
-
-    try {
-        if (!conversation_id) {
-            const newConversation = new Conversation({ user_id: userId, title: message.substring(0, 40) });
-            const savedConversation = await newConversation.save();
-            conversation_id = savedConversation._id;
-        }
-        
-        const userMessage = new Message({ conversation_id, sender: 'user', content: message });
-        await userMessage.save();
-
-        const history = await Message.find({ conversation_id }).sort({ createdAt: -1 }).limit(10);
-        const chatHistory = history.map(msg => ({
-            role: msg.sender === 'user' ? 'user' : 'model',
-            parts: [{ text: msg.content }]
-        })).reverse();
-
-        const chat = model.startChat({ history: chatHistory });
-        const result = await chat.sendMessage(message);
-        const aiResponseContent = result.response.text();
-        
-        const aiMessage = new Message({ conversation_id, sender: 'ai', content: aiResponseContent });
-        await aiMessage.save();
-
-        await Conversation.findByIdAndUpdate(conversation_id, { updatedAt: Date.now() });
-
-        res.json({ aiResponse: aiMessage, conversation_id: conversation_id });
-    } catch (error) {
-        console.error("Gemini API Error:", error);
-        res.status(500).json({ "error": "Failed to get response from AI." });
-    }
-});
+// NOTE: The non-streaming /api/messages route has been removed & replaced by the streaming version below
 
 // DELETE /api/conversations/:id
 app.delete('/api/conversations/:id', async (req, res) => {
@@ -214,6 +175,71 @@ app.post('/api/conversations/:id/generate-title', async (req, res) => {
     } catch (error) {
         console.error("Failed to generate title:", error);
         res.status(500).json({ error: "Failed to generate title." });
+    }
+});
+
+app.post('/api/messages', async (req, res) => {
+    if (!model) {
+        return res.status(500).json({ error: "AI model not initialized. Check server logs for API Key issues." });
+    }
+
+    let { conversation_id, message } = req.body;
+    const userId = '12345';
+
+    try {
+        if (!conversation_id) {
+            const newConversation = new Conversation({ user_id: userId, title: message.substring(0, 40) });
+            const savedConversation = await newConversation.save();
+            conversation_id = savedConversation._id;
+        }
+
+        // Persist user message first so history includes it
+        const userMessage = new Message({ conversation_id, sender: 'user', content: message });
+        await userMessage.save();
+
+        // Build recent history (include last 12 messages for more context)
+        const history = await Message.find({ conversation_id }).sort({ createdAt: -1 }).limit(12);
+        const ordered = history.reverse();
+        const historyLines = ordered.map(msg => `${msg.sender === 'user' ? 'User' : 'Assistant'}: ${msg.content}`);
+        // Construct a single prompt with conversation context + instruction
+        const fullPrompt = `${historyLines.join('\n')}\nAssistant:`;
+
+        // SSE headers
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders && res.flushHeaders();
+
+        let fullResponse = '';
+        try {
+            const result = await model.generateContentStream(fullPrompt);
+            for await (const chunk of result.stream) {
+                const token = chunk.text();
+                if (!token) continue;
+                fullResponse += token;
+                res.write(`data: ${JSON.stringify({ text: token })}\n\n`);
+            }
+        } catch(streamErr) {
+            console.error('Streaming error:', streamErr);
+            res.write(`data: ${JSON.stringify({ error: 'stream_failed' })}\n\n`);
+            return res.end();
+        }
+
+        // Save assistant message AFTER full stream
+        const aiMessage = new Message({ conversation_id, sender: 'ai', content: fullResponse });
+        await aiMessage.save();
+        await Conversation.findByIdAndUpdate(conversation_id, { updatedAt: Date.now() });
+
+        // Final metadata event
+        res.write(`data: ${JSON.stringify({ conversationId: conversation_id, messageId: aiMessage._id })}\n\n`);
+        res.end();
+
+    } catch (error) {
+        console.error("Gemini API Stream Error:", error);
+        if (!res.headersSent) {
+            return res.status(500).json({ error: 'Internal server error' });
+        }
+        res.end();
     }
 });
 

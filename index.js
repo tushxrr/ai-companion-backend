@@ -9,6 +9,7 @@ require('dotenv').config();
 
 const Conversation = require('./models/conversation.model.js');
 const Message = require('./models/message.model.js');
+const authMiddleware = require('./authMiddleware'); // Import the new middleware
 
 // --- INITIAL SETUP ---
 const app = express();
@@ -52,11 +53,15 @@ if (process.env.GEMINI_API_KEY) {
 // ==========================================================
 // --- API ROUTES ---
 // ==========================================================
+// Protect API routes with Firebase auth middleware
+app.use('/api/conversations', authMiddleware);
+app.use('/api/messages', authMiddleware);
+app.use('/api/summarize', authMiddleware);
 
 // GET /api/conversations
 app.get('/api/conversations', async (req, res) => {
     try {
-        const userId = '12345';
+    const userId = req.user.uid; // verified user id from auth middleware
         const conversations = await Conversation.find({ user_id: userId }).sort({ updatedAt: -1 });
         res.json(conversations);
     } catch (error) {
@@ -67,7 +72,13 @@ app.get('/api/conversations', async (req, res) => {
 // GET /api/conversations/:id
 app.get('/api/conversations/:id', async (req, res) => {
     try {
-        const messages = await Message.find({ conversation_id: req.params.id }).sort({ createdAt: 1 });
+        const conversationId = req.params.id;
+        // Ensure the requested conversation belongs to the authenticated user
+        const convo = await Conversation.findOne({ _id: conversationId, user_id: req.user.uid });
+        if (!convo) {
+            return res.status(404).json({ error: 'Conversation not found' });
+        }
+        const messages = await Message.find({ conversation_id: conversationId }).sort({ createdAt: 1 });
         res.json(messages);
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -81,6 +92,11 @@ app.get('/api/conversations/:id', async (req, res) => {
 app.delete('/api/conversations/:id', async (req, res) => {
     try {
         const conversationId = req.params.id;
+        // Verify ownership before delete
+        const convo = await Conversation.findOne({ _id: conversationId, user_id: req.user.uid });
+        if (!convo) {
+            return res.status(404).json({ error: 'Conversation not found' });
+        }
         await Message.deleteMany({ conversation_id: conversationId });
         await Conversation.findByIdAndDelete(conversationId);
         res.status(200).json({ message: 'Conversation deleted successfully' });
@@ -122,11 +138,11 @@ app.put('/api/conversations/:id', async (req, res) => {
             return res.status(400).json({ error: 'Title is required' });
         }
 
-        // Find the conversation by its ID and update its title
-        const updatedConversation = await Conversation.findByIdAndUpdate(
-            conversationId,
+        // Find the conversation by its ID and user, then update its title
+        const updatedConversation = await Conversation.findOneAndUpdate(
+            { _id: conversationId, user_id: req.user.uid },
             { title: title },
-            { new: true } // This option tells Mongoose to return the updated document
+            { new: true }
         );
 
         if (!updatedConversation) {
@@ -148,6 +164,12 @@ app.post('/api/conversations/:id/generate-title', async (req, res) => {
 
     try {
         const conversationId = req.params.id;
+
+        // Ensure the conversation belongs to the user
+        const convo = await Conversation.findOne({ _id: conversationId, user_id: req.user.uid });
+        if (!convo) {
+            return res.status(404).json({ error: 'Conversation not found' });
+        }
 
         // Fetch the first 2 messages of the conversation for context
         const messages = await Message.find({ conversation_id: conversationId }).sort({ createdAt: 'asc' }).limit(2);
@@ -184,7 +206,7 @@ app.post('/api/messages', async (req, res) => {
     }
 
     let { conversation_id, message } = req.body;
-    const userId = '12345';
+    const userId = req.user.uid; // Use verified user id
 
     try {
         if (!conversation_id) {
@@ -196,6 +218,12 @@ app.post('/api/messages', async (req, res) => {
         // Persist user message first so history includes it
         const userMessage = new Message({ conversation_id, sender: 'user', content: message });
         await userMessage.save();
+
+        // Optional security: ensure the conversation we append to belongs to this user
+        const convo = await Conversation.findOne({ _id: conversation_id, user_id: userId });
+        if (!convo) {
+            return res.status(404).json({ error: 'Conversation not found' });
+        }
 
         // Build recent history (include last 12 messages for more context)
         const history = await Message.find({ conversation_id }).sort({ createdAt: -1 }).limit(12);

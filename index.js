@@ -3,7 +3,7 @@
 // --- IMPORTS ---
 const express = require('express');
 const mongoose = require('mongoose');
-const cors =require('cors');
+const cors = require('cors');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
 

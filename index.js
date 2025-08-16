@@ -16,7 +16,29 @@ const app = express();
 const PORT = 3001;
 
 // --- MIDDLEWARE ---
-app.use(cors());
+// Enable CORS for all origins
+app.use(cors({
+    origin: true,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept']
+}));
+
+// Additional CORS headers for preflight requests
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    
+    // Handle preflight requests
+    if (req.method === 'OPTIONS') {
+        res.sendStatus(200);
+    } else {
+        next();
+    }
+});
+
 app.use(express.json());
 
 // --- DATABASE CONNECTION ---
@@ -53,6 +75,22 @@ if (process.env.GEMINI_API_KEY) {
 // ==========================================================
 // --- API ROUTES ---
 // ==========================================================
+
+// Root route - Health check
+app.get('/', (req, res) => {
+    res.json({
+        message: 'AI Companion Backend API is running!',
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        version: '1.0.0'
+    });
+});
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+    res.json({ ok: true, ts: Date.now() });
+});
+
 // Protect API routes with Firebase auth middleware
 app.use('/api/conversations', authMiddleware);
 app.use('/api/messages', authMiddleware);

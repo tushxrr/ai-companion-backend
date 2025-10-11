@@ -16,28 +16,29 @@ const app = express();
 const PORT = 3001;
 
 // --- MIDDLEWARE ---
-// Enable CORS for all origins
+// Enable CORS for all origins with explicit headers
+app.use((req, res, next) => {
+    // Set CORS headers explicitly
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    
+    // Handle preflight OPTIONS requests
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+    
+    next();
+});
+
+// Also use the cors middleware as backup
 app.use(cors({
     origin: true,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept']
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
-
-// Additional CORS headers for preflight requests
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
-    res.header('Access-Control-Allow-Credentials', 'true');
-    
-    // Handle preflight requests
-    if (req.method === 'OPTIONS') {
-        res.sendStatus(200);
-    } else {
-        next();
-    }
-});
 
 app.use(express.json());
 
@@ -55,20 +56,61 @@ mongoose.connect(MONGO_URI)
     });
 
 // --- GEMINI API SETUP ---
-// **THIS SECTION IS NOW MORE ROBUST**
+let genAI = null;
 let model;
+const modelName = 'gemini-flash-latest'; // Use a stable, compatible model
+
 if (process.env.GEMINI_API_KEY) {
     try {
-        const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        model = genAI.getGenerativeModel({ model: "gemini-1.5-flash"});
-        console.log("✅ Gemini AI model initialized successfully.");
+        genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+        model = genAI.getGenerativeModel({ model: modelName });
+        console.log(`✅ Gemini AI model initialized successfully. model=${modelName}`);
     } catch (error) {
         console.error("❌ ERROR initializing Gemini AI. Your API key may be invalid.", error.message);
     }
 } else {
     console.error("❌ FATAL ERROR: GEMINI_API_KEY is not defined in your .env file.");
-    // We don't initialize the model if the key is missing.
-    // The routes below will handle this case.
+}
+
+// --- HELPERS ---
+/**
+ * Safely extract text from a Gemini response object.
+ */
+function safeGeminiText(result) {
+    try {
+        if (!result) return '';
+        if (result.response && typeof result.response.text === 'function') {
+            return String(result.response.text() || '').trim();
+        }
+        // Some SDK versions return { response: { candidates: [...] } }
+        if (result.response && Array.isArray(result.response.candidates)) {
+            const cand = result.response.candidates.find(c => c.content && Array.isArray(c.content.parts));
+            if (cand) {
+                return cand.content.parts.map(p => p.text || '').join('').trim();
+            }
+        }
+    } catch (err) {
+        console.error('safeGeminiText extraction error:', err);
+    }
+    return '';
+}
+
+/**
+ * Light normalization of an enhanced prompt (remove wrapping quotes or leading filler).
+ */
+function normalizeEnhancedPrompt(text) {
+    if (!text) return '';
+    let cleaned = text.trim();
+    // Remove starting phrases Gemini often adds
+    cleaned = cleaned.replace(/^sure[,!\s-]*here(?:'s| is) (?:an |the )?improved prompt:?\s*/i, '');
+    // Strip enclosing quotes/backticks if the whole thing is wrapped
+    if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
+        cleaned = cleaned.slice(1, -1).trim();
+    }
+    if (cleaned.startsWith('```') && cleaned.endsWith('```')) {
+        cleaned = cleaned.replace(/^```[a-zA-Z0-9]*\n?/, '').replace(/```$/, '').trim();
+    }
+    return cleaned;
 }
 
 
@@ -91,10 +133,34 @@ app.get('/api/health', (req, res) => {
     res.json({ ok: true, ts: Date.now() });
 });
 
+// Quick AI health check (dev tool): verifies the Gemini API key by making a tiny call.
+// Note: keep lightweight; you can remove or protect this in production.
+app.get('/api/ai-check', async (req, res) => {
+    const start = Date.now();
+    if (!model) {
+        return res.status(500).json({ ok: false, reason: 'model_not_initialized', hint: 'Check GEMINI_API_KEY in .env' });
+    }
+    try {
+        const result = await model.generateContent('Return the word PONG.');
+        const text = safeGeminiText(result);
+        const ok = typeof text === 'string' && /pong/i.test(text);
+        return res.json({
+            ok,
+            ms: Date.now() - start,
+            sample: (text || '').slice(0, 120),
+            model: 'gemini-1.5-flash'
+        });
+    } catch (e) {
+        return res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
 // Protect API routes with Firebase auth middleware
 app.use('/api/conversations', authMiddleware);
 app.use('/api/messages', authMiddleware);
 app.use('/api/summarize', authMiddleware);
+app.use('/api/enhance-prompt', authMiddleware);
+
 
 // GET /api/conversations
 app.get('/api/conversations', async (req, res) => {
@@ -150,19 +216,142 @@ app.post('/api/summarize', async (req, res) => {
     }
 
     try {
-        const { conversationText } = req.body;
+        let { conversationText, mode } = req.body || {};
         if (!conversationText) {
             return res.status(400).json({ error: 'No conversation text provided.' });
         }
 
-        const prompt = `Please provide a concise, one-paragraph summary of the following conversation:\n\n${conversationText}`;
-        const result = await model.generateContent(prompt);
-        const summaryResponse = result.response.text();
-        res.json({ summary: summaryResponse });
+        // Trim excessive length (protect tokens). Keep last 18k chars.
+        const TRUNCATION_LIMIT = 18000;
+        let truncated = false;
+        if (conversationText.length > TRUNCATION_LIMIT) {
+            conversationText = conversationText.slice(-TRUNCATION_LIMIT);
+            truncated = true;
+        }
 
+        // Mode selection (future extensibility)
+        const summaryMode = (mode || 'structured').toLowerCase();
+        // Base structured prompt (Option A+ with sentiment & topics)
+        const structuredPrompt = `You are an AI assistant that produces a concise, high-signal structured summary of a multi-turn chat between a User and an Assistant.
+OUTPUT REQUIREMENTS:
+- Output ONLY valid JSON (no Markdown) following this exact schema:
+{
+  "summary": ["short bullet", ...],
+  "key_points": ["bullet", ...],
+  "action_items": ["bullet", ...],
+  "open_questions": ["bullet", ...],
+  "sentiment": "short tone phrase",
+  "topics": ["topic", ...],
+  "short_mode": false
+}
+- Omit empty bullets (use [] for empty arrays). Use lowercase topics (2-6 unique, concise nouns).
+- Each bullet <= 18 words, no numbering, no quotes inside strings unless part of original text.
+- Do NOT hallucinate. Derive only from the conversation content provided.
+- "action_items" only if explicit or strongly implied tasks/goals.
+- "open_questions" only for unresolved user questions.
+- If total turns < 3 set: summary = [single bullet capturing core intent], other arrays empty, short_mode=true.
+- Ensure output is strictly JSON with double quotes and valid escaping.
+
+Conversation:
+"""
+${conversationText}
+"""`;
+
+        // Additional modes (can extend later)
+        const prompt = structuredPrompt; // currently only one effective mode
+
+        const result = await model.generateContent(prompt);
+        const raw = safeGeminiText(result) || '';
+
+        // Try to extract JSON (some models may wrap with markdown fences)
+        let jsonText = raw.trim();
+        jsonText = jsonText.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+        let parsed;
+        try {
+            parsed = JSON.parse(jsonText);
+        } catch(parseErr) {
+            console.warn('Summarize JSON parse failed, falling back to plaintext:', parseErr.message);
+        }
+
+        // Fallback if parsing failed or mandatory fields missing
+        const ensureArray = v => Array.isArray(v) ? v : [];
+        if (!parsed || !parsed.summary) {
+            parsed = {
+                summary: raw ? raw.split(/\n+/).slice(0,5).map(l=>l.trim()).filter(Boolean) : [],
+                key_points: [],
+                action_items: [],
+                open_questions: [],
+                sentiment: '',
+                topics: [],
+                short_mode: false,
+                fallback: true
+            };
+        } else {
+            parsed.summary = ensureArray(parsed.summary);
+            parsed.key_points = ensureArray(parsed.key_points);
+            parsed.action_items = ensureArray(parsed.action_items);
+            parsed.open_questions = ensureArray(parsed.open_questions);
+            parsed.topics = ensureArray(parsed.topics);
+            parsed.short_mode = !!parsed.short_mode;
+        }
+
+        return res.json({
+            structured: parsed,
+            summary: parsed.summary && Array.isArray(parsed.summary) ? parsed.summary.join('\n') : '', // legacy field
+            truncated,
+            raw
+        });
     } catch (error) {
         console.error("Gemini Summarization Error:", error);
         res.status(500).json({ error: "Failed to create summary." });
+    }
+});
+
+// POST /api/enhance-prompt - Enhance a user's prompt using a meta-prompt
+app.post('/api/enhance-prompt', async (req, res) => {
+    if (!model) {
+        return res.status(500).json({ error: "AI model not initialized. Check server logs for API Key issues." });
+    }
+
+    try {
+        const requestId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+        const { prompt } = req.body || {};
+        const rawPrompt = (prompt || '').toString();
+        if (!rawPrompt.trim()) {
+            return res.status(400).json({ error: 'No prompt provided.' });
+        }
+        if (rawPrompt.length > 4000) {
+            return res.status(413).json({ error: 'Prompt too long (limit 4000 chars).' });
+        }
+
+        const metaPrompt = `You are an expert prompt engineer. Rewrite ONLY the user's text into a higher quality, specific prompt for a large language model.
+Rules:
+- Preserve intent, do not add external facts.
+- Add clarifying constraints (audience, format, style) if helpful.
+- Prefer bullet points for multi-part tasks.
+- Make the output self-contained and unambiguous.
+- Output ONLY the improved prompt (no commentary, no quotes).
+
+User text begins:
+<<<
+${rawPrompt}
+>>>
+Improved prompt:`;
+
+        const result = await model.generateContent(metaPrompt);
+        const enhancedRaw = safeGeminiText(result);
+        const enhancedPrompt = normalizeEnhancedPrompt(enhancedRaw);
+
+        if (!enhancedPrompt) {
+            console.warn(`[enhance-prompt][${requestId}] Empty enhancement result.`);
+            return res.status(502).json({ error: 'AI returned an empty result.' });
+        }
+
+        console.log(`[enhance-prompt][${requestId}] OK length=${enhancedPrompt.length}`);
+        return res.json({ enhancedPrompt, requestId });
+    } catch (error) {
+        console.error('Enhance prompt error:', error);
+        return res.status(500).json({ error: 'Failed to enhance prompt.', details: error.message });
     }
 });
 
@@ -287,7 +476,7 @@ app.post('/api/messages', async (req, res) => {
             }
         } catch(streamErr) {
             console.error('Streaming error:', streamErr);
-            res.write(`data: ${JSON.stringify({ error: 'stream_failed' })}\n\n`);
+            res.write(`data: ${JSON.stringify({ error: 'gemini_api_error', details: streamErr.message })}\n\n`);
             return res.end();
         }
 
@@ -296,7 +485,7 @@ app.post('/api/messages', async (req, res) => {
         await aiMessage.save();
         await Conversation.findByIdAndUpdate(conversation_id, { updatedAt: Date.now() });
 
-        // Final metadata event
+    // Final metadata event
         res.write(`data: ${JSON.stringify({ conversationId: conversation_id, messageId: aiMessage._id })}\n\n`);
         res.end();
 

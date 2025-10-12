@@ -16,10 +16,18 @@ const app = express();
 const PORT = 3001;
 
 // --- MIDDLEWARE ---
-// Enable CORS for all origins with explicit headers
+// Enable CORS for the specific frontend origin
 app.use((req, res, next) => {
-    // Set CORS headers explicitly
-    res.header('Access-Control-Allow-Origin', '*');
+    // Set CORS headers explicitly for the production frontend
+    const allowedOrigin = 'https://ai-companion-self.vercel.app';
+    const origin = req.headers.origin;
+    
+    if (origin === allowedOrigin || !origin || origin.includes('localhost')) {
+        res.header('Access-Control-Allow-Origin', origin || allowedOrigin);
+    } else {
+        res.header('Access-Control-Allow-Origin', allowedOrigin);
+    }
+    
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.header('Access-Control-Allow-Credentials', 'true');
@@ -34,7 +42,14 @@ app.use((req, res, next) => {
 
 // Also use the cors middleware as backup
 app.use(cors({
-    origin: true,
+    origin: (origin, callback) => {
+        const allowedOrigins = ['https://ai-companion-self.vercel.app', 'http://localhost:5173', 'http://localhost:3000'];
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(null, true); // Still allow for now to debug
+        }
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']

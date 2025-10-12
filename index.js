@@ -16,30 +16,29 @@ const app = express();
 const PORT = 3001;
 
 // --- MIDDLEWARE ---
-const allowedOrigins = [
-    'http://localhost:5173',
-    'https://ai-companion-self.vercel.app'
-];
+// Enable CORS for all origins with explicit headers
+app.use((req, res, next) => {
+    // Set CORS headers explicitly
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    
+    // Handle preflight OPTIONS requests
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+    
+    next();
+});
 
-const corsOptions = {
-    origin: (origin, callback) => {
-        // Allow requests with no origin (like mobile apps or curl requests)
-        if (!origin) return callback(null, true);
-        if (allowedOrigins.indexOf(origin) === -1) {
-            const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
-            return callback(new Error(msg), false);
-        }
-        return callback(null, true);
-    },
+// Also use the cors middleware as backup
+app.use(cors({
+    origin: true,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
-};
-
-app.use(cors(corsOptions));
-
-// Handle preflight requests across all routes
-app.options('*', cors(corsOptions));
+}));
 
 app.use(express.json());
 

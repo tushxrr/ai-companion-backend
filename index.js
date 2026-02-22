@@ -59,16 +59,18 @@ app.use(express.json());
 
 // --- DATABASE CONNECTION ---
 const MONGO_URI = process.env.MONGO_URI;
-if (!MONGO_URI) {
-    console.error("FATAL ERROR: MONGO_URI is not defined in your .env file.");
-    process.exit(1); // Exit the application if the database string is missing
+if (process.env.NODE_ENV !== 'test') {
+    if (!MONGO_URI) {
+        console.error("FATAL ERROR: MONGO_URI is not defined in your .env file.");
+        process.exit(1); // Exit the application if the database string is missing
+    }
+    mongoose.connect(MONGO_URI)
+        .then(() => console.log("MongoDB connected successfully!"))
+        .catch(err => {
+            console.error("MongoDB connection error:", err);
+            process.exit(1);
+        });
 }
-mongoose.connect(MONGO_URI)
-    .then(() => console.log("MongoDB connected successfully!"))
-    .catch(err => {
-        console.error("MongoDB connection error:", err);
-        process.exit(1);
-    });
 
 // --- GEMINI API SETUP ---
 let genAI = null;
@@ -515,6 +517,10 @@ app.post('/api/messages', async (req, res) => {
 
 
 // --- START THE SERVER ---
-app.listen(PORT, () => {
-    console.log(`🚀 Server is running on http://localhost:${PORT}`);
-});
+if (require.main === module) {
+    app.listen(PORT, () => {
+        console.log(`🚀 Server is running on http://localhost:${PORT}`);
+    });
+}
+
+module.exports = app;
